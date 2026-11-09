@@ -1,0 +1,25 @@
+[package]
+name = "ptp-clock"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "Complete mechanism layer for the Linux PTP hardware clock (PHC): the full PTP_* ioctl family and hardware timestamping."
+readme = "README.md"
+repository = "https://github.com/lenitain/ptp-clock"
+keywords = ["ptp", "phc", "clock", "linux", "timestamp"]
+categories = ["os::linux-apis", "hardware-support"]
+authors = ["lenitain <xt.zhu@qq.com>"]
+
+include = [
+    "Cargo.toml",
+    "LICENSE",
+    "README.md",
+    "DESIGN.md",
+    "src/",
+]
+
+[lib]
+name = "ptp_clock"
+path = "src/lib.rs"
+
+[dependencies]
