@@ -51,7 +51,7 @@ Rust 生态中存在一类反复出现的缺口：很多领域已经有"能调�
 ## 范围（机制层 · 必须做）
 
 1. **时钟能力查询**：`PTP_CLOCK_GETCAPS` / `PTP_CLOCK_GETCAPS2` → 类型化的 `Capabilities`（max_adj、n_ext_ts、n_per_out、pps、n_pins、cross_timestamping、adjust_phase、max_phase_adj），据此暴露可用 API。
-2. **时间读写**：`PTP_CLOCK_GETTIME` 与 `PTP_CLOCK_SETTIME`（注意：本 crate 头文件里的 ioctl 列表没有单独的 GETTIME/SETTIME——实测依赖 libc 的 `clock_adjtime` 或直接 ioctl；见"内核事实 F2"与清单 A 核实项）。
+2. **时间读写**：PHC 是 POSIX 动态时钟（`clock_posix_dynamic`），**没有** GETTIME/SETTIME ioctl——读写与调频走 `clock_gettime` / `clock_settime` / `clock_adjtime`，并把 **fd 当 `clockid_t`**（见"内核事实 F2"）。
 3. **系统偏移**：`PTP_SYS_OFFSET`（`PTP_SYS_OFFSET2`）、`PTP_SYS_OFFSET_PRECISE`（`..._PRECISE2`）、`PTP_SYS_OFFSET_EXTENDED`（`..._EXTENDED2`）→ 成对的系统/PHC 采样结果类型化。
 4. **外部时间戳**：`PTP_EXTTS_REQUEST` / `PTP_EXTTS_REQUEST2`——配置、订阅、从 fd `read()` 事件队列读取时间戳事件；RAII 句柄（drop 时释放）。
 5. **周期输出**：`PTP_PEROUT_REQUEST` / `PTP_PEROUT_REQUEST2`——周期信号输出配置；RAII 句柄。
@@ -108,45 +108,74 @@ Rust 生态中存在一类反复出现的缺口：很多领域已经有"能调�
 ## API 草案
 
 ```rust
-pub struct PtpClock { /* RAII: /dev/ptpN fd */ }
-pub struct Capabilities { /* max_adj, n_ext_ts, n_per_out, pps, n_pins, cross_timestamping, adjust_phase, max_phase_adj */ }
-pub struct ClockTime { /* sec: i64, nsec: u32 —— 对应 struct ptp_clock_time */ }
-pub enum ExtTsEdge { Rising, Falling, Both }        // 映射 PTP_RISING/FALLING/两者
-pub struct ExtTsRequest { pub index: u32, pub edge: ExtTsEdge, pub flags: ExtTsFlags }
-pub struct PeroutRequest { /* start/phase, period, index, one_shot, duty_cycle, phase */ }
+// ioctl 注入边界：默认 impl 直接调 libc::ioctl；测试注入可模拟内核回写与 errno。
+pub trait Ioctl {
+    fn ioctl(&self, fd: BorrowedFd<'_>, request: IoctlRequest, buffer: &mut [u8]) -> io::Result<()>;
+    fn ioctl_value(&self, fd: BorrowedFd<'_>, request: IoctlRequest, value: c_ulong) -> io::Result<()>;
+}
+pub struct SystemIoctl;
+pub struct IoctlRequest(/* c_ulong */);       // PTP_* 与 SIOC[GS]HWTSTAMP 常量 + raw()/name()
+
+pub struct PtpClock { /* OwnedFd + Box<dyn Ioctl + Send + Sync> + writable */ }
+pub struct Capabilities { /* max_adj, n_alarm, n_ext_ts, n_per_out, pps, n_pins, cross_timestamping, adjust_phase, max_phase_adj */ }
+pub struct ClockTime { /* sec: i64, nsec: u32 —— 对应 struct ptp_clock_time，构造时归一化 */ }
+pub struct ExtTsFlags(u32);                   // ENABLE_FEATURE / RISING_EDGE / FALLING_EDGE / EXT_OFFSET
+pub struct ExtTsRequest { pub index: u32, pub flags: ExtTsFlags }
+pub enum ExtTsEdge { Rising, Falling, Both }
+pub enum PeroutStart { Absolute(ClockTime), Phase(ClockTime) }
+pub struct PeroutRequest { pub index, pub period, pub start: PeroutStart, pub duty_cycle: Option<ClockTime>, pub one_shot: bool }
+pub enum PinFunc { None, ExtTs, Perout, Physync, Unknown(u32) }
 pub struct PinFunction { pub index: u32, pub func: PinFunc, pub chan: u32 }
-pub enum PinFunc { None, ExtTs, Perout, Physync }   // PTP_PF_*
-pub struct SysOffset { /* n_samples + (sys, phc) 成对 + 末尾系统时间戳 */ }
+pub struct PinDescription { pub name: Option<String>, pub index: u32, pub func: PinFunc, pub chan: u32 }
+pub struct SysOffset { pub samples: Vec<SysOffsetSample>, pub sys_after: ClockTime }
+pub struct SysOffsetSample { pub sys: ClockTime, pub phc: ClockTime }
 pub struct SysOffsetPrecise { pub device: ClockTime, pub sys_realtime: ClockTime, pub sys_monoraw: ClockTime }
-pub struct SysOffsetExtended { /* n_samples + 每样本 [pre, phc, post] */ }
-pub struct ExtTsEvent { pub timestamp: ClockTime, pub index: u32, pub flags: u32 }  // struct ptp_extts_event
+pub struct SysOffsetExtended { pub samples: Vec<SysOffsetExtendedSample> }
+pub struct SysOffsetExtendedSample { pub pre: ClockTime, pub phc: ClockTime, pub post: ClockTime }
+pub struct ExtTsEvent { /* time, index, flags —— 与 struct ptp_extts_event 同布局，fd 直接 read */ }
 
 impl PtpClock {
-    pub fn open(index: u32) -> Result<Self>;            // /dev/ptp{index}
-    pub fn open_path(path: &Path) -> Result<Self>;      // 逃生舱
-    pub fn capabilities(&self) -> Result<Capabilities>; // GETCAPS2，失败降级 GETCAPS
-    pub fn set_time(&self, t: ClockTime) -> Result<()>;
-    pub fn get_time(&self) -> Result<ClockTime>;        // 见 F2 核实项
-    pub fn adjust_freq(&self, ppb: i64) -> Result<()>;  // 见 F2 核实项
+    pub fn open(index: u32) -> Result<Self>;              // /dev/ptp{index}，O_RDWR→O_RDONLY 降级
+    pub fn open_path(path: impl AsRef<Path>) -> Result<Self>;  // 逃生舱
+    pub fn from_fd(fd: OwnedFd, ioctl: Box<dyn Ioctl + Send + Sync>) -> Self; // 注入/虚拟设备
+    pub fn as_fd(&self) -> BorrowedFd<'_>;                // 逃生舱：事件队列直接 read/poll
+    pub fn is_writable(&self) -> bool;
+    pub fn capabilities(&self) -> Result<Capabilities>;   // GETCAPS2，ENOTTY 降级 GETCAPS
+    pub fn get_time(&self) -> Result<ClockTime>;          // clock_gettime(fd)
+    pub fn set_time(&self, t: ClockTime) -> Result<()>;   // clock_settime(fd)，需 O_RDWR
+    pub fn adjust_freq(&self, ppb: i64) -> Result<()>;    // ADJ_FREQUENCY，ppb→scaled ppm 精确反解
+    pub fn frequency_ppb(&self) -> Result<i64>;           // clock_adjtime(modes = 0)
+    pub fn adjust_phase(&self, nanos: i64) -> Result<()>; // ADJ_OFFSET | ADJ_NANO
+    pub fn step_time(&self, offset: ClockTime) -> Result<()>; // ADJ_SETOFFSET | ADJ_NANO
     pub fn sys_offset(&self, n_samples: u32) -> Result<SysOffset>;
     pub fn sys_offset_precise(&self) -> Result<SysOffsetPrecise>;
-    pub fn sys_offset_extended(&self, n_samples: u32, clockid: i32) -> Result<SysOffsetExtended>;
-    pub fn request_ext_ts(&self, req: &ExtTsRequest) -> Result<ExtTsHandle>;  // RAII: drop 释放
-    pub fn request_perout(&self, req: &PeroutRequest) -> Result<PeroutHandle>; // RAII: drop 释放
-    pub fn set_pin_func(&self, f: &PinFunction) -> Result<()>;
+    pub fn sys_offset_extended(&self, n_samples: u32, clockid: clockid_t) -> Result<SysOffsetExtended>;
+    pub fn request_ext_ts(&self, req: &ExtTsRequest) -> Result<ExtTsHandle<'_>>;   // RAII
+    pub fn request_perout(&self, req: &PeroutRequest) -> Result<PeroutHandle<'_>>; // RAII
+    pub fn read_event(&self) -> Result<Option<ExtTsEvent>>;        // EAGAIN → Ok(None)
+    pub fn read_events(&self, events: &mut [ExtTsEvent]) -> Result<usize>; // 零拷贝，支持部分读
+    pub fn pin_function(&self, index: u32) -> Result<PinDescription>;
+    pub fn set_pin_function(&self, f: &PinFunction) -> Result<()>;
     pub fn enable_pps(&self, enabled: bool) -> Result<()>;
-    pub fn as_fd(&self) -> BorrowedFd<'_>;              // 逃生舱：事件队列直接 read
 }
-pub struct ExtTsHandle { /* RAII: 持有请求配置，drop 时写 PTP_EXTTS_REQUEST(enable=0) */ }
-pub struct PeroutHandle { /* RAII: drop 时写 period=0 禁用 */ }
+pub struct ExtTsHandle<'a> { /* drop 写 enable=0；release() 返回错误，disarm() 显式放弃 */ }
+pub struct PeroutHandle<'a> { /* drop 写 period=0；release()/disarm() */ }
 
-// 网卡侧硬件时间戳配置
-pub enum HwTxType { Off, On, OneStepSync, OneStepP2P }  // HWTSTAMP_TX_*
-pub enum HwRxFilter { None, All, Some, PtpV1L4Event, PtpV2L4Event, PtpV2L2Event, PtpV2Event, NtpAll, /* ... 全集 */ }
-pub struct HwTimestamping;
+// 错误：operation（哪个 API/ioctl）+ kind（ENOTTY/EINVAL/EBUSY/EPERM 归类）+ source(errno)
+pub enum Error { Open { .. }, Ioctl { .. }, Read { .. }, InvalidRequest { .. } }
+pub enum ErrorKind { NotSupported, InvalidArgument, Busy, PermissionDenied, NotFound, Other }
+pub enum Operation { /* 每个公开 API 一个变体 */ }
+
+// 网卡侧硬件时间戳配置：持有注入边界（与 PtpClock 同构），纯转换函数可单测
+pub enum HwTxType { Off, On, OneStepSync, OneStepP2P, Unknown(i32) }
+pub enum HwRxFilter { None, All, Some, PtpV1L4Event, /* …全集… */ NtpAll, Unknown(i32) }
+pub struct HwTimestampConfig { pub flags: u32, pub tx_type: HwTxType, pub rx_filter: HwRxFilter }
+pub struct HwTimestamping { /* Box<dyn Ioctl + Send + Sync> */ }
 impl HwTimestamping {
-    pub fn set(sock: &Socket, ifname: &str, tx: HwTxType, rx: HwRxFilter) -> Result<HwRxFilter>;
-    pub fn get(sock: &Socket, ifname: &str) -> Result<HwTimestampConfig>;
+    pub fn new() -> Self;
+    pub fn with_ioctl(ioctl: Box<dyn Ioctl + Send + Sync>) -> Self;
+    pub fn set<F: AsFd>(&self, sock: F, ifname: &str, tx: HwTxType, rx: HwRxFilter) -> Result<HwRxFilter>;
+    pub fn get<F: AsFd>(&self, sock: F, ifname: &str) -> Result<HwTimestampConfig>;
 }
 
 // 模块划分
@@ -176,13 +205,19 @@ impl HwTimestamping {
 | 更新（v6.x+）：`PTP_MASK_CLEAR_ALL`(19)、`PTP_MASK_EN_SINGLE`(20)、`PTP_SYS_OFFSET_PRECISE_CYCLES`(21)、`PTP_SYS_OFFSET_EXTENDED_CYCLES`(22)——v1 可不实现，常量保留 | `ptp_clock.h` |
 | **策略**：优先用 V2（严格标志校验），内核不支持 V2 时报 `ENOTTY` 再降级 V1；`PTP_EXTTS_REQUEST2` 下 `PTP_STRICT_FLAGS` 由内核始终强制 | `ptp_clock.h` 注释 |
 
-### F2. 时间读写（重要核实项）
+### F2. 时间读写（已核实 · 2026-11-14，内核 7.4.0-rc2 源码）
 
 | 事实 | 出处 |
 |---|---|
-| `ptp_clock.h` **没有单独的 GETTIME/SETTIME ioctl**——PHC 时间读写走 `clock_adjtime(2)`（`struct timex` 的 `ADJ_SETOFFSET`/`ADJ_OFFSET`/`ADJ_FREQUENCY`）或 `PTP_SYS_OFFSET` 派生；`linuxptp` 用 `clock_adjtime` 读/steer | 头文件核对结论 |
-| **实现前必须核实**：`get_time`/`set_time`/`adjust_freq` 的确切内核路径（对照 `drivers/ptp/ptp_clock.c` 与 `kernel/time/posix-clock.c`；`clock_gettime(CLOCK_REALTIME)` 不对，PHC 通过 `clock_gettime(fd)` 用 `CLOCKFD` 或 `clock_adjtime`）——见清单 A | 待核实（清单 A） |
-| 已有 `clock_gettime(fd, ...)`：POSIX 时钟 fd（`CLOCKFD`）方式可直接读 PHC 时间 | man `clock_gettime(2)` |
+| `ptp_clock.h` **没有单独的 GETTIME/SETTIME ioctl**；PHC 通过 `posix_clock_register()` 注册为 POSIX 动态时钟（`clock_posix_dynamic`），时间操作以 **fd 当 `clockid_t`** 分发 | `drivers/ptp/ptp_clock.c`（`ptp_clock_ops`）、`kernel/time/posix-clock.c` |
+| `get_time` = `clock_gettime(fd_to_clockid(fd), &ts)` → `pc_clock_gettime` → `ptp_clock_gettime`（优先 `gettimex64`，否则 `gettime64`）；注册时强制二者至少其一，故核心层不会 `EOPNOTSUPP` | `posix-clock.c:248`、`ptp_clock.c:111`、`ptp_clock.c:336` |
+| `set_time` = `clock_settime(fd_to_clockid(fd), &ts)` → `pc_clock_settime`：fd 必须 **O_RDWR**（`FMODE_WRITE`，否则 `EACCES`）；`timespec64_valid_settod` 失败 `EINVAL`；PHC 被虚拟时钟占用时 `EBUSY`；注册时强制 `settime64` 存在。**核心层不检查 `CAP_SYS_TIME`**（与 `PTP_ENABLE_PPS` 不同），权限由设备节点 + O_RDWR 决定 | `posix-clock.c:286`、`ptp_clock.c:96` |
+| `adjust_freq` = `clock_adjtime(fd_to_clockid(fd), &timex)`，`modes = ADJ_FREQUENCY`：`tx.freq` 是 scaled ppm（16 位二进制小数），内核算 `ppb = (1 + ppm) * 125 >> 13`，`\|ppb\| > max_adj` → `ERANGE`，否则调 `info->adjfine(ops, tx.freq)`。modes≠0 时同样要求 O_RDWR | `posix-clock.c:224`、`ptp_clock.c:123–180`、`include/linux/ptp_clock_kernel.h:264` |
+| 反向换算（ppb → scaled ppm）必须取 `ppm = ceil(ppb * 8192 / 125) - 1`，才能保证内核算回的 ppb 与请求值完全相等（否则 `max_adj` 边界会差 1 ppb） | 由上式反解 + 单测 |
+| `clock_adjtime(modes = 0)` 回读 `tx.freq = dialed_frequency`（scaled ppm），可用于 `frequency_ppb()` | `ptp_clock.c:196` |
+| `modes = ADJ_OFFSET \| ADJ_NANO` → `info->adjphase(offset_ns)`（无 `adjphase` 则 `EOPNOTSUPP`，超出 `max_phase_adj` 则 `ERANGE`）；`modes = ADJ_SETOFFSET \| ADJ_NANO` → `info->adjtime(delta)`（时间步进） | `ptp_clock.c:180–195` |
+| `clock_getres(fd)` 恒返回 1 ns（`ptp_clock_getres`），无实用价值，不暴露 | `ptp_clock.c:89` |
+| clockid 编码：`fd_to_clockid(fd) = ((~(unsigned)fd) << 3) \| 3`，反向 `clockid_to_fd(clk) = ~(clk >> 3)`；`CLOCKFD = 3`。用户态 libc 不提供该宏，需自行计算 | `include/linux/posix-timers.h:33`、`include/linux/posix-timers_types.h:31` |
 
 ### F3. 能力与结构体（逐字核实）
 
@@ -232,7 +267,7 @@ impl HwTimestamping {
 - `ptp_sys_offset` 交错数组：**2*n_samples+1** 项，偶数位（0,2,4,…）是系统时间戳、奇数位是 PHC 时间戳、**最后一项是系统时间戳**（不是 PHC）——解析不能错位。
 - `sys_offset_extended`：每样本三值 [pre, PHC, post]，n_samples 行；`clockid` 字段 6.12+，向旧内核发送时置 0。
 - `extts_event` 数组读取：一次 `read()` 可能返回 0..N 个事件；`EAGAIN`（非阻塞）→ `Ok(None)`；按 32 字节对齐处理部分读。
-- 结构体大小断言：`ptp_clock_time`=16（4+4+8 对齐）、`ptp_extts_request`=12、`ptp_sys_offset`=832（4+12+16*51）、`ptp_extts_event`=32（16+4+4+8）、`ptp_pin_desc`=96（64+12+20）（用 `size_of` 断言，防平台漂移）。
+- 结构体大小断言：`ptp_clock_time`=16、`ptp_clock_caps`=80、`ptp_extts_request`=16（4+4+4*2）、`ptp_perout_request`=56、`ptp_sys_offset`=832（4+12+16*51）、`ptp_sys_offset_extended`=1216（16+16*75）、`ptp_sys_offset_precise`=64、`ptp_extts_event`=32（16+4+4+8）、`ptp_pin_desc`=96（64+12+20）（用 `size_of` 断言，防平台漂移）。`ifreq` 按内核尺寸留足（64 位 40 字节、32 位 32 字节），并按 `ifr_name`/`ifr_data` 偏移（0/16）访问。
 - 能力字段语义：`max_adj` 单位 ppb；`n_pins` 为 0 表示无引脚功能；`cross_timestamping`/`adjust_phase` 布尔。
 - ioctl 错误透传：`ENOTTY`（不是 PHC/不支持 V2）、`EINVAL`（非法参数/标志）、`EBUSY`、`EPERM`——全部类型化并带上下文。
 - `SIOCSHWTSTAMP`：通过 `ifreq` 设置 `ifr_name` + `ifr_data`；**返回的 rx_filter 可能被驱动降级**，必须回读并透传给调用者。
@@ -244,36 +279,37 @@ impl HwTimestamping {
 ### A. 内核事实核实（实现前 · 最优先）
 
 - [x] 已核实 F1/F3/F4/F5（本机 `ptp_clock.h`/`net_tstamp.h`/`sockios.h` 逐字核对）。
-- [ ] 剩余核实项（开工第一天做，改 DESIGN.md 再动手）：**F2 时间读写路径**——`get_time`/`set_time`/`adjust_freq` 走 `clock_adjtime` 还是 `clock_gettime(fd)`（对照 `drivers/ptp/ptp_clock.c`、`kernel/time/posix-clock.c`、man `clock_gettime(2)`）；`PTP_MASK_*`(19/20) 与 `_CYCLES`(21/22) 是否纳入 v1 范围。
-- [ ] 本机是否可读 `/dev/ptp*`（无硬件时跳过，用 ioctl 注入代替）。
+- [x] **F2 时间读写路径**（2026-11-14，内核 7.4.0-rc2 源码）：PHC 是 POSIX 动态时钟，`get/set/adjust` 全走 fd-as-clockid 的 `clock_gettime`/`clock_settime`/`clock_adjtime`；写入需 O_RDWR；`ADJ_FREQUENCY` 用 scaled ppm。
+- [x] `PTP_MASK_*`(19/20) 与 `_CYCLES`(21/22) 排除在 v1 范围外：前者是 per-open 事件队列掩码（6.14+），后者是 cycles 时间源（需 `has_cycles`），均非 PHC 基本机制；常量保留在 `IoctlRequest`。
+- [x] 本机无 `/dev/ptp*`（2026-11-14 复核），全部走 ioctl 注入。
 
 ### B. API 文档（随实现一起写）
 
-- [ ] 每个公开项（类型/变体/字段/方法/常量）都有文档注释；`#![warn(missing_docs)]` 常驻，CI 以 `RUSTFLAGS=-D warnings` 强制。
-- [ ] 每个公开 API 有**可运行的 doctest**：自建最小夹具（合成结构体字节 / ioctl 注入模拟成功与错误），在 CI 的 `cargo test` 中编译运行；真实硬件的用法用 `no_run`（仍编译校验）+ 可选 example。
-- [ ] README 只写总览 + 一个主示例；用法细节由各 API 的 doctest 承载。
-- [ ] 错误类型每个变体的字段都有文档；`Display` / `Error::source` 链完整。
+- [x] 每个公开项（类型/变体/字段/方法/常量）都有文档注释；`#![warn(missing_docs)]` 常驻，CI 以 `RUSTFLAGS=-D warnings` 强制。
+- [x] 每个公开 API 有 doctest（纯逻辑可运行；真实硬件用法 `no_run` 编译校验），`cargo test` 中编译运行；`examples/inspect.rs` 给出真实设备用法。
+- [x] README 只写总览 + 一个主示例；用法细节由各 API 的 doctest 承载。
+- [x] 错误类型每个变体的字段都有文档；`Display` / `Error::source` 链完整。
 
 ### C. 测试覆盖
 
-- [ ] 单元测试覆盖解析/状态机的每条分支（含容错分支）。
-- [ ] 集成测试覆盖公开 API 的 happy path + **每个错误变体**的触发路径（ENOTTY / EINVAL / EBUSY / EPERM / 文件不存在）。
-- [ ] 系统相关分支可测：ioctl 注入边界测成功与错误路径；`sys_offset` 交错数组解释、`extts_event` 解析用合成字节；`SIOCSHWTSTAMP` 在真实 loopback socket 上测错误路径（返回 EOPNOTSUPP/ENODEV）。
-- [ ] 特性矩阵：`cargo test`（默认）与 `cargo test --no-default-features` 都绿。
-- [ ] 本项目测试重点：结构体大小断言；V2→V1 降级路径；`sys_offset` 数组 2n+1 布局；`extts_event` 部分读/EAGAIN；RAII 句柄释放（drop 写 enable=0）。
+- [x] 单元测试覆盖每条解析分支（含未知标志/未知功能码保留）。
+- [x] 集成测试覆盖公开 API 的 happy path + **每个错误变体**的触发路径（ENOTTY / EINVAL / ERANGE / EBUSY / EPERM / 文件不存在）。
+- [x] 系统相关分支可测：ioctl 注入边界测成功与错误路径；`sys_offset` 交错数组解释、`extts_event` 解析用合成字节；`SIOC[GS]HWTSTAMP` 在真实 loopback socket 上测错误路径。
+- [x] 特性矩阵：`cargo test`（默认）与 `cargo test --no-default-features` 都绿（crate 无 feature）。
+- [x] 本项目测试重点：结构体大小断言；V2→V1 降级路径；`sys_offset` 数组 2n+1 布局；`extts_event` 读取/EAGAIN；RAII 句柄释放（drop 写 enable=0 / period=0）。
 
 ### D. 仓库卫生（对齐 fanotify-fid 约定）
 
-- [ ] `Cargo.lock` 不提交（库 crate），加入 `.gitignore`（含 `/target`、编辑器杂项）。
-- [ ] DESIGN.md 是过程文件：README 不引用、Cargo.toml 的 `include` 不含 DESIGN.md（**当前仓库这两处都还没改，实现时必须改**）。
-- [ ] LICENSE 文本对齐同系列：MIT 全文 + 版权行 `Copyright (c) 2026 <crate> contributors`（用 "contributors" 而非个人名；**当前仓库是个人名，必须改**）。只要求文本内容一致，行尾格式（LF/CRLF）不做要求。
-- [ ] CI（`.github/workflows/ci.yml`）：test（特性矩阵）/ fmt / clippy / doc 四 job，`RUSTFLAGS="-D warnings"`（**当前仓库没有 CI，必须新建**）。
-- [ ] 提交前本地全绿：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
+- [x] `Cargo.lock` 不提交（库 crate），已加入 `.gitignore`（含 `/target`、编辑器杂项）。
+- [x] DESIGN.md 是过程文件：README 不引用、Cargo.toml 的 `include` 不含 DESIGN.md。
+- [x] LICENSE 文本对齐同系列：MIT 全文 + `Copyright (c) 2026 ptp-clock contributors`。
+- [x] CI（`.github/workflows/ci.yml`）：test（特性矩阵）/ fmt / clippy / doc 四 job，`RUSTFLAGS="-D warnings"`。
+- [x] 本地全绿：`cargo fmt --check`、`cargo clippy --all-targets -- -D warnings`、`RUSTDOCFLAGS="-D warnings" cargo doc --no-deps`。
 
 ### E. 特性设计
 
-- [ ] 可选依赖用 feature 门控、默认开启；`default-features = false` 必须能零依赖构建（核心只用 `libc`）。
-- [ ] 特性矩阵进 CI（默认 + 无默认）。
+- [x] 无可选依赖；`default-features = false` 构建等价于默认构建（核心只用 `libc`）。
+- [x] 特性矩阵进 CI（默认 + 无默认）。
 
 ## 参考
 
@@ -298,7 +334,7 @@ impl HwTimestamping {
 - 结构体：`ptp_clock_time`(16B)、`ptp_extts_request`(12B)、`ptp_perout_request`、`ptp_sys_offset`（2n+1 交错，末尾系统时间戳）、`ptp_sys_offset_extended`（[pre,PHC,post]，clockid 6.12+）、`ptp_sys_offset_precise`、`ptp_pin_desc`、`ptp_extts_event`(32B)。
 - 标志：EXTTS（ENABLE/RISING/FALLING/STRICT/EXT_OFFSET）、PEROUT（ONE_SHOT/DUTY_CYCLE/PHASE，period=0 禁用）。
 - 网卡侧：`SIOCSHWTSTAMP`=0x89b0 / `SIOCGHWTSTAMP`=0x89b1，`ifreq.ifr_data`→`hwtstamp_config`；rx_filter 可能被驱动降级。
-- **待核实（清单 A）**：`get_time`/`set_time`/`adjust_freq` 的确切内核路径（`clock_adjtime` vs `clock_gettime(fd)`）。
+- **F2 已核实**：PHC = POSIX 动态时钟，`clock_gettime` / `clock_settime` / `clock_adjtime`（fd 当 clockid）；`set/adj` 需 O_RDWR；`adj_freq` 用 scaled ppm，`ppb = ((1+ppm)*125)>>13`。
 - 生态：`rtime-clock` 只覆盖读/steer → B 类。
 
 ### 已定的 API 决策（不要推翻）
@@ -309,6 +345,5 @@ impl HwTimestamping {
 ### 开工第一天必须做的（其余见清单 A）
 
 1. 通读本 DESIGN.md 全文 + 同目录 `AGENTS.md`。
-2. 完成清单 A 核实项：**F2 时间读写路径**（决定 `get_time`/`set_time`/`adjust_freq` 用 `clock_adjtime` 还是 `clock_gettime(fd)`）；`PTP_MASK_*` 是否纳入。
-3. 从 `src/ioctl.rs`（注入边界）+ 纯结构体编解码起步，再 clock/offset → extts/perout（RAII）→ pin/pps → socktstamp。
-4. 全部绿后一次性写入正式目录并单次提交（`--amend` 合并后续修改）。
+2. 从 `src/ioctl.rs`（注入边界）+ 纯结构体编码起步，再 clock/offset → extts/perout（RAII）→ pin/pps → socktstamp。
+3. 全部绿后一次性写入正式目录并单次提交。

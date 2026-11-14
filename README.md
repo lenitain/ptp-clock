@@ -1,18 +1,34 @@
 # ptp-clock
 
-Complete mechanism layer for the Linux PTP hardware clock (PHC): the full PTP_* ioctl family and hardware timestamping.
+[![Crates.io](https://img.shields.io/crates/v/ptp-clock.svg)](https://crates.io/crates/ptp-clock)
+[![Documentation](https://docs.rs/ptp-clock/badge.svg)](https://docs.rs/ptp-clock)
+[![License](https://img.shields.io/crates/l/ptp-clock.svg)](LICENSE)
+[![CI](https://github.com/lenitain/ptp-clock/actions/workflows/ci.yml/badge.svg)](https://github.com/lenitain/ptp-clock/actions/workflows/ci.yml)
 
-> **Status: design stage.** The crate skeleton and API sketch exist; nothing is implemented yet.
+Complete mechanism layer for the Linux PTP hardware clock (PHC): the full `PTP_*` ioctl family and hardware timestamping.
 
-## Design
+The crate covers what `/dev/ptpN` and `SIOC[GS]HWTSTAMP` expose — capabilities, reading and steering the clock, system-offset sampling, external timestamps with an event queue, periodic outputs, pins, PPS, and per-interface timestamping configuration — with `repr(C)` layouts checked against the UAPI, V2-first ioctls that fall back to V1, RAII handles, and errors that name the failed operation. Policy stays with the caller: no event loop, no clock discovery, no servo algorithm; `PtpClock::as_fd` and `PtpClock::open_path` are the escape hatches.
 
-The full design document lives in [DESIGN.md](DESIGN.md). It defines:
+```rust
+use ptp_clock::{ExtTsRequest, PtpClock};
 
-- **Scope (mechanism layer — must do):** what this crate implements completely and correctly.
-- **Non-goals (policy layer — must not do):** what is deliberately left to the caller, so the crate never constrains user behavior.
-- **API sketch, correctness concerns, and naming rationale.**
+fn main() -> Result<(), ptp_clock::Error> {
+    let clock = PtpClock::open(0)?;
+    let caps = clock.capabilities()?;
+    println!("max_adj={} ppb, ext_ts={}", caps.max_adj, caps.n_ext_ts);
+    println!("PHC time: {}", clock.get_time()?);
 
-## Layout philosophy
+    // The handle releases the channel when it goes out of scope.
+    let _ext_ts = clock.request_ext_ts(&ExtTsRequest::rising(0))?;
+    if let Some(event) = clock.read_event()? {
+        println!("rising edge on channel {} at {}", event.index(), event.time());
+    }
+    Ok(())
+}
+```
 
-This crate follows the same layering as [`fanotify-fid`](https://crates.io/crates/fanotify-fid): a complete mechanism layer
-(protocol/parsing/correctness) with the policy layer (event loop, caching, strategy) left to the application.
+Everything above needs a PHC and the matching permissions; `cargo run --example inspect` prints the same information for a device on the local machine.
+
+## License
+
+MIT

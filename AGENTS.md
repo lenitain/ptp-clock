@@ -8,7 +8,7 @@
 
 ## 2. 实现流程（按顺序，不要跳步）
 
-1. **核实事实（最优先）**——DESIGN.md 的"内核事实"F1/F3/F4/F5 已核实并带出处（本机 `ptp_clock.h`/`net_tstamp.h`/`sockios.h` 逐字核对），**直接用，不要重新调查**；清单 A 剩 1 个大项（F2 时间读写路径：`get_time`/`set_time`/`adjust_freq` 走 `clock_adjtime` 还是 `clock_gettime(fd)`，对照 `drivers/ptp/ptp_clock.c` + man `clock_gettime(2)`/`clock_adjtime(2)` 核完再动手）——linux-pstore 教训：假设被内核源码推翻，返工一整段。
+1. **核实事实（最优先）**——DESIGN.md 的"内核事实"F1–F5 全部已核实并带出处（本机 UAPI 头逐字核对 + 内核 7.4.0-rc2 源码 `drivers/ptp/*`、`kernel/time/posix-clock.c`），**直接用，不要重新调查**。F2 结论：PHC 是 POSIX 动态时钟，`get/set/adjust` 走 `clock_gettime`/`clock_settime`/`clock_adjtime`（fd 当 clockid），写入需 O_RDWR，调频用 scaled ppm。
 2. **开工即拿真实样例验证**——本机无 PHC，用**合成样例**：结构体字节流（构造/解析）、`sys_offset` 交错数组、`extts_event` 数组。`SIOCSHWTSTAMP` 可以用真实 loopback socket 测错误路径（返回 EOPNOTSUPP）。
 3. **在 `/tmp` 开发实现**——按 DESIGN.md 的模块划分，从 `src/ioctl.rs`（注入边界）+ 纯结构体编解码起步，再 clock/offset → extts/perout（RAII）→ pin/pps → socktstamp，每个模块边写边补单元测试；不在正式目录里磨。
 4. **集成测试**——happy path + **每个错误变体** + V2→V1 降级 + 容错；RAII 句柄 drop 释放验证。
@@ -21,7 +21,7 @@
 ## 3. 两个 crate 的复盘：没做好的事（别再犯）
 
 ### 3.1 事实核实与真实样例
-- **内核事实核实太晚 / 假设被推翻**：linux-pstore 的文件名格式、压缩算法两项假设都被内核源码推翻，返工一整段。→ 本项目 F1/F3/F4 已核（头文件逐字），**F2（时间读写路径）是最大的待核实项**，开工第一天必须核完：`ptp_clock.h` 里没有 GETTIME/SETTIME ioctl，很容易想当然用错 API。
+- **内核事实核实太晚 / 假设被推翻**：linux-pstore 的文件名格式、压缩算法两项假设都被内核源码推翻，返工一整段。→ 本项目 F1–F5 全部已核（头文件逐字 + 内核源码）；F2 证明 `ptp_clock.h` 里确实没有 GETTIME/SETTIME ioctl，时间是 fd-as-clockid 的 `clock_gettime`/`clock_settime`/`clock_adjtime`——这正是"想当然用错 API"的典型，结论已写进 DESIGN.md。
 - **真实语法验证太晚**：apparmor-policy 拿真实 profile 才测出 3 个漏掉的语法。→ 本项目没有真实设备，**fixture 就是一切**：结构体字节、`sys_offset` 数组、`extts_event` 数组的合成样例开工第一天就建。
 
 ### 3.2 解析器的细节坑（apparmor-policy 反复踩，全是真实 bug）
@@ -63,13 +63,13 @@
 - **逃生舱**：`open_path`、`as_fd()`（事件队列直接 read）、原始 ioctl 透传入口。
 - **别做过头**：不要在 `request_ext_ts` 里自动 set_pin_func（那是用户显式选择）；不要在 drop 里隐式清时间戳配置以外的任何东西；不要替用户决定读事件队列的时机。
 
-### 4.4 当前仓库待修项（实现时必须一并修完）
-- README.md 引用了 DESIGN.md 且没有四个徽章 → 重写为"总览 + 一个主示例 + 四个徽章"。
-- Cargo.toml 的 `include` 含 `DESIGN.md` → 移除；补 `documentation` 字段。
-- LICENSE 版权行是 `Copyright (c) 2026 lenitain` → 改为 `Copyright (c) 2026 ptp-clock contributors`。
-- 缺 CHANGELOG.md、缺 `.github/workflows/ci.yml` → 新建。
-- 当前 0 个 commit、全部文件 untracked → 实现完一次性提交。
-- src/lib.rs 是占位骨架 → 按 DESIGN.md 模块划分重写。
+### 4.4 仓库状态（2026-11-14 已实现，以下项均已修完）
+- README.md 已重写为"四个徽章 + 总览 + 一个主示例"，不再引用 DESIGN.md。
+- Cargo.toml 的 `include` 已移除 `DESIGN.md`，补了 `documentation`；`Cargo.lock` 已从版本控制移除。
+- LICENSE 版权行已是 `Copyright (c) 2026 ptp-clock contributors`。
+- 已有 CHANGELOG.md 与 `.github/workflows/ci.yml`（test 特性矩阵 / fmt / clippy / doc 四 job）。
+- src/lib.rs 骨架已按模块划分重写：module `clock`/`offset`/`extts`/`perout`/`pin`/`pps`/`socktstamp`/`ioctl`/`error`，公开项在 crate 根重导出。
+- 已知实现取舍：RAII 句柄 drop 里的释放失败被忽略（模块无日志依赖），需要错误时用 `release()`；如需日志可后续加 feature 门控的 `log`。
 
 ## 5. 仓库卫生清单（提交前逐项勾）
 
